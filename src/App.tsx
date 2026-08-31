@@ -9,6 +9,7 @@ import { computePeaks, deriveWords, hashStr, synthesizeDemoWav, type Peaks } fro
 import { clearDB, idbClearAll, idbDel, idbGet, idbPut, loadDB, saveDB } from "./lib/db";
 import { DEMO_FILES } from "./lib/demoData";
 import { generateSegmentsFor, runTranscriptionJob, withWords } from "./lib/transcribe";
+import { exportPortableZip } from "./lib/zipExport";
 import { usePlayer } from "./hooks/usePlayer";
 import { fmtTime, uid, type DBShape, type FileRec, type JobState, type Segment, type ToastMsg } from "./lib/types";
 
@@ -52,12 +53,13 @@ const peakCache = new Map<string, Peaks>();
 
 export default function App() {
   const [db, setDb] = useState<DBShape>(() => loadDB() ?? buildSeedDB());
-  const [selectedId, setSelectedId] = useState<string | null>(() => (loadDB() ?? { files: [] }).files[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activeTags, setActiveTags] = useState<string[]>([]);
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [toasts, setToasts] = useState<ToastMsg[]>([]);
   const [archOpen, setArchOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
 
@@ -86,6 +88,22 @@ export default function App() {
     setToasts((t) => [...t.slice(-3), { id, kind, text }]);
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
+
+  /* ---------- portable ZIP export ---------- */
+  const handleExportZip = useCallback(async () => {
+    if (exporting) return;
+    setExporting(true);
+    pushToast("info", "パッケージ中…（index.html + assets + ランチャー）");
+    try {
+      const res = await exportPortableZip();
+      pushToast("ok", `${res.name} を保存しました（${res.fileCount}ファイル / ${(res.bytes / 1024 / 1024).toFixed(1)} MB）— 解凍後 start.bat をダブルクリックで起動`);
+    } catch (e) {
+      console.error(e);
+      pushToast("err", "ZIPの作成に失敗しました。リロードしてお試しください。");
+    } finally {
+      setExporting(false);
+    }
+  }, [exporting, pushToast]);
 
   /* ---------- audio resolution ---------- */
   useEffect(() => {
@@ -374,6 +392,22 @@ export default function App() {
               <span className="hidden rounded-full border border-amber-acc/40 bg-amber-acc/10 px-2.5 py-1 font-tc text-[9.5px] text-amber-acc xl:inline-block">
                 browser prototype
               </span>
+              <button
+                onClick={handleExportZip}
+                disabled={exporting}
+                title="ポータブル版をZIPに打包（解凍後 start.bat ダブルクリックで起動）"
+                className="flex items-center gap-1.5 rounded-full border border-teal-deep/60 bg-teal-deep/10 px-3 py-1 text-[11px] font-bold text-teal-acc transition-all hover:bg-teal-deep/25 active:scale-95 disabled:cursor-wait disabled:opacity-60"
+              >
+                {exporting ? (
+                  <svg className="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 3a9 9 0 019 9" /></svg>
+                ) : (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
+                    <path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
+                  </svg>
+                )}
+                {exporting ? "打包中…" : "ZIP書出"}
+              </button>
               <button
                 onClick={() => setArchOpen(true)}
                 className="flex items-center gap-1.5 rounded-full border border-ink-600 px-3 py-1 text-[11px] font-bold text-mist-300 transition-all hover:border-amber-acc/50 hover:text-amber-acc active:scale-95"
