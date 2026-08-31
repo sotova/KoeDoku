@@ -62,7 +62,7 @@ function FileIcon({ path }: { path: string }) {
 const STEPS: { title: string; desc: string }[] = [
   { title: "いずれかの方法でZIPを保存", desc: "下の3ルートから、お使いの環境で使えるものを選択" },
   { title: "ZIPを右クリック → すべて展開", desc: "保存した KoeDoku-portable.zip を展開" },
-  { title: "展開したフォルダの start.bat をダブルクリック", desc: "macOS / Linux の場合は start.sh を実行" },
+  { title: "展開したフォルダの start.bat をダブルクリック", desc: "index.html を直接ダブルクリックでも起動できます（JS/CSSは単一ファイルに内蔵済み）。macOS / Linux は start.sh" },
   { title: "ブラウザで起動完了", desc: "インターネット接続は不要。音声の取込・文字起こし・字幕同期がそのまま使えます" },
 ];
 
@@ -131,7 +131,7 @@ export default function ExportModal({ open, onClose, building, error, onRetry, r
           {building && (
             <div className="flex items-center gap-3 rounded-lg border border-ink-600 bg-ink-800 px-4 py-3.5">
               <svg className="h-4 w-4 animate-spin text-amber-acc" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 3a9 9 0 019 9" /></svg>
-              <p className="text-[12.5px] text-mist-300">ビルド資産を収集中…（index.html + assets + ランチャー）</p>
+              <p className="text-[12.5px] text-mist-300">単一ファイルへJS/CSSを内蔵中…（file:// 起動に対応）</p>
             </div>
           )}
           {error && (

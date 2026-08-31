@@ -1,9 +1,9 @@
 /* ============================================================
  * ポータブルZIPパッケージング
  * 実行中のビルド資産(index.html + assets/)を収集し、
- * Windows用ランチャー(start.bat)とREADMEを添えてZIP化する。
- * 保存は File System Access API(保存ダイアログ)を優先し、
- * 非対応環境では従来ダウンロードへフォールバックする。
+ * JS / CSS を HTML へ完全インライン化した単一ファイルを生成する。
+ * 単一ファイル化により、file:// プロトコルでのダブルクリック起動でも
+ * ブラウザの CORS / モジュールブロックを受けずに動作する。
  * ============================================================ */
 import JSZip from "jszip";
 
@@ -53,14 +53,15 @@ function makeReadme(name: string, fileCount: number, sizeMB: string): string {
     "  1. Right-click this ZIP -> \"Extract All\" (please extract to a folder)",
     "  2. Open the extracted folder",
     "  3. Double-click  start.bat  (macOS / Linux: ./start.sh)",
+    "     - You can also just double-click index.html directly",
     "  4. KoeDoku will launch in your browser",
     "",
     "  * No internet connection is required for operation.",
-    "  * Do not rename index.html or the assets folder (playback will break).",
+    "  * All scripts and styles are embedded in index.html (single file),",
+    "    so it works even when opened directly from file://.",
     "",
     "■ Contents (" + fileCount + " files / approx. " + sizeMB + " MB)",
-    "  index.html ....... app body",
-    "  assets/ .......... scripts and styles required for operation",
+    "  index.html ....... app body (JS / CSS embedded)",
     "  start.bat ........ Windows launcher (double-click to launch)",
     "  start.sh ......... macOS / Linux launcher",
     "  README.txt ....... this file",
@@ -102,16 +103,18 @@ function collectAssetHrefs(): { htmlUrl: string; assetUrls: string[] } {
   return { htmlUrl: htmlUrl.href, assetUrls };
 }
 
+function escRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export async function buildPortableZip(): Promise<ExportResult> {
   const zip = new JSZip();
   const entries: ExportEntry[] = [];
-  let total = 0;
 
   const add = (path: string, data: Blob | string, note?: string) => {
     zip.file(path, data);
     const bytes = typeof data === "string" ? new Blob([data]).size : data.size;
     entries.push({ path, bytes, note });
-    total += bytes;
   };
 
   const { htmlUrl, assetUrls } = collectAssetHrefs();
@@ -119,29 +122,38 @@ export async function buildPortableZip(): Promise<ExportResult> {
   if (!htmlRes.ok) throw new Error("index.html fetch failed");
   let html = await htmlRes.text();
 
+  /* JS / CSS を HTML へインライン化（file:// 起動を可能にする核心） */
   for (const url of assetUrls) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`asset fetch failed: ${url}`);
-    const blob = await res.blob();
-    const rel = new URL(url).pathname.replace(/^\//, "");
-    html = html.split(url).join(rel);
-    try {
-      html = html.split(decodeURI(url)).join(rel);
-    } catch {
-      /* noop */
+    const text = await res.text();
+    const base = url.split("/").pop() ?? "";
+    const baseEsc = escRe(base);
+    if (base.endsWith(".js")) {
+      /* バンドル内に "</script" が含まれても壊れないようエスケープ */
+      const safe = text.replace(/<\/script/gi, "<\\/script");
+      html = html.replace(
+        new RegExp(`<script[^>]*src="[^"]*${baseEsc}"[^>]*>\\s*</script>`),
+        `<script type="module">${safe}</script>`
+      );
+    } else if (base.endsWith(".css")) {
+      const safe = text.replace(/<\/style/gi, "<\\/style");
+      html = html.replace(
+        new RegExp(`<link[^>]*href="[^"]*${baseEsc}"[^>]*/?>`),
+        `<style>${safe}</style>`
+      );
     }
-    add(rel, blob);
   }
 
-  // file:// で開けるよう絶対参照を相対へ
-  html = html.replace(/(src|href)="\//g, '$1="./');
+  /* 安全策: 残ったルート絶対参照を相対へ（favicon 等） */
+  html = html.replace(/(src|href)="\/(?!\/)/g, '$1="./');
 
-  add("index.html", html);
+  add("index.html", html, "app body (JS / CSS embedded)");
   add("start.bat", START_BAT, "Windows launcher");
   add("start.sh", START_SH, "macOS / Linux launcher");
 
   const name = "KoeDoku-portable.zip";
-  const readme = makeReadme(name, entries.length + 1, "0.5");
+  const readme = makeReadme(name, entries.length + 1, (entries.reduce((a, e) => a + e.bytes, 0) / 1024 / 1024).toFixed(2));
   add("README.txt", readme);
 
   const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
@@ -210,11 +222,7 @@ export function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
-/* ---------------- テキスト復元ルート ----------------
- * ダウンロードがブロックされる環境でも、Base64テキストを
- * コピー→PC上のテキストファイルへ保存→Windows標準のcertutilで
- * 復元することで確実にZIPを取り込める。
- * ---------------------------------------------------- */
+/* ---------------- text-route utilities (code copy & restore) ---------------- */
 
 export const CODE_FILE_NAME = "koedoku-code.txt";
 export const RESTORE_BAT_NAME = "restore-koedoku.bat";
@@ -232,7 +240,7 @@ export async function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-/** certutil で Base64 テキストから ZIP を復元する Windows スクリプト */
+/** Windows標準のcertutilでBase64テキストからZIPを復元するスクリプト */
 export function restoreBatScript(): string {
   return `@echo off
 title KoeDoku ZIP Decoder
@@ -267,7 +275,7 @@ endlocal
 `;
 }
 
-/** クリップボードへコピー（非セキュア環境のフォールバック付き） */
+/** クリップボードへコピー（セキュアコンテキスト外のフォールバック付き） */
 export async function copyText(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard && window.isSecureContext) {
