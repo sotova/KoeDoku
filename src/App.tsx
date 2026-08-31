@@ -9,7 +9,8 @@ import { computePeaks, deriveWords, hashStr, synthesizeDemoWav, type Peaks } fro
 import { clearDB, idbClearAll, idbDel, idbGet, idbPut, loadDB, saveDB } from "./lib/db";
 import { DEMO_FILES } from "./lib/demoData";
 import { generateSegmentsFor, runTranscriptionJob, withWords } from "./lib/transcribe";
-import { exportPortableZip } from "./lib/zipExport";
+import { buildPortableZip, openZipInNewTab, savePortableZip, type ExportResult } from "./lib/zipExport";
+import ExportModal from "./components/ExportModal";
 import { usePlayer } from "./hooks/usePlayer";
 import { fmtTime, uid, type DBShape, type FileRec, type JobState, type Segment, type ToastMsg } from "./lib/types";
 
@@ -59,7 +60,11 @@ export default function App() {
   const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [toasts, setToasts] = useState<ToastMsg[]>([]);
   const [archOpen, setArchOpen] = useState(false);
-  const [exporting, setExporting] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportBuilding, setExportBuilding] = useState(false);
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [exportErr, setExportErr] = useState<string | null>(null);
+  const [justSaved, setJustSaved] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
 
@@ -90,20 +95,46 @@ export default function App() {
   }, []);
 
   /* ---------- portable ZIP export ---------- */
-  const handleExportZip = useCallback(async () => {
-    if (exporting) return;
-    setExporting(true);
-    pushToast("info", "パッケージ中…（index.html + assets + ランチャー）");
-    try {
-      const res = await exportPortableZip();
-      pushToast("ok", `${res.name} を保存しました（${res.fileCount}ファイル / ${(res.bytes / 1024 / 1024).toFixed(1)} MB）— 解凍後 start.bat をダブルクリックで起動`);
-    } catch (e) {
-      console.error(e);
-      pushToast("err", "ZIPの作成に失敗しました。リロードしてお試しください。");
-    } finally {
-      setExporting(false);
+  const buildExport = useCallback(() => {
+    setExportBuilding(true);
+    setExportErr(null);
+    buildPortableZip()
+      .then((r) => setExportResult(r))
+      .catch((e) => {
+        console.error(e);
+        setExportErr("ビルド資産の収集に失敗しました。ページをリロードしてから再試行してください。");
+      })
+      .finally(() => setExportBuilding(false));
+  }, []);
+
+  const openExport = useCallback(() => {
+    setExportOpen(true);
+    setJustSaved(false);
+    if (!exportResult && !exportBuilding) buildExport();
+  }, [exportResult, exportBuilding, buildExport]);
+
+  const handleSaveZip = useCallback(async () => {
+    if (!exportResult) return;
+    const outcome = await savePortableZip(exportResult);
+    if (outcome === "saved") {
+      setJustSaved(true);
+      pushToast("ok", `${exportResult.name} を保存しました — 解凍して start.bat をダブルクリックで起動できます`);
+      window.setTimeout(() => setJustSaved(false), 3000);
+    } else if (outcome === "cancelled") {
+      pushToast("info", "保存をキャンセルしました");
+    } else {
+      pushToast("err", "保存できませんでした。「別タブで開く」をお試しください");
     }
-  }, [exporting, pushToast]);
+  }, [exportResult, pushToast]);
+
+  const handleOpenZipTab = useCallback(() => {
+    if (!exportResult) return;
+    if (openZipInNewTab(exportResult.blob)) {
+      pushToast("info", "ZIPを別タブで開きました。ブラウザの保存操作で取り込んでください");
+    } else {
+      pushToast("err", "ポップアップがブロックされました。ブラウザの許可設定をご確認ください");
+    }
+  }, [exportResult, pushToast]);
 
   /* ---------- audio resolution ---------- */
   useEffect(() => {
@@ -393,20 +424,15 @@ export default function App() {
                 browser prototype
               </span>
               <button
-                onClick={handleExportZip}
-                disabled={exporting}
-                title="ポータブル版をZIPに打包（解凍後 start.bat ダブルクリックで起動）"
-                className="flex items-center gap-1.5 rounded-full border border-teal-deep/60 bg-teal-deep/10 px-3 py-1 text-[11px] font-bold text-teal-acc transition-all hover:bg-teal-deep/25 active:scale-95 disabled:cursor-wait disabled:opacity-60"
+                onClick={openExport}
+                title="このアプリをZIPとしてパソコンに保存（オフラインで起動可能）"
+                className="flex items-center gap-1.5 rounded-full border border-teal-deep/60 bg-teal-deep/10 px-3 py-1 text-[11px] font-bold text-teal-acc transition-all hover:bg-teal-deep/25 active:scale-95"
               >
-                {exporting ? (
-                  <svg className="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 3a9 9 0 019 9" /></svg>
-                ) : (
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
-                    <path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
-                  </svg>
-                )}
-                {exporting ? "打包中…" : "ZIP書出"}
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
+                  <path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
+                </svg>
+                ZIP書出
               </button>
               <button
                 onClick={() => setArchOpen(true)}
@@ -497,6 +523,17 @@ export default function App() {
 
       {activeJob && <JobPanel job={activeJob} onCancel={cancelJob} />}
       <ArchitectureModal open={archOpen} onClose={() => setArchOpen(false)} />
+      <ExportModal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        building={exportBuilding}
+        error={exportErr}
+        onRetry={buildExport}
+        result={exportResult}
+        onSave={handleSaveZip}
+        onOpenTab={handleOpenZipTab}
+        justSaved={justSaved}
+      />
 
       {/* toasts */}
       <div className="pointer-events-none fixed right-4 top-4 z-[60] flex w-[320px] flex-col gap-2">
