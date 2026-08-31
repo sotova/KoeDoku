@@ -533,6 +533,7 @@ export default function App() {
         onSave={handleSaveZip}
         onOpenTab={handleOpenZipTab}
         justSaved={justSaved}
+        onToast={pushToast}
       />
 
       {/* toasts */}

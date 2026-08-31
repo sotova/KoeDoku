@@ -209,3 +209,87 @@ export function fmtBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
+
+/* ---------------- テキスト復元ルート ----------------
+ * ダウンロードがブロックされる環境でも、Base64テキストを
+ * コピー→PC上のテキストファイルへ保存→Windows標準のcertutilで
+ * 復元することで確実にZIPを取り込める。
+ * ---------------------------------------------------- */
+
+export const CODE_FILE_NAME = "koedoku-code.txt";
+export const RESTORE_BAT_NAME = "restore-koedoku.bat";
+
+export async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      const idx = s.indexOf(",");
+      resolve(idx >= 0 ? s.slice(idx + 1) : s);
+    };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+/** certutil で Base64 テキストから ZIP を復元する Windows スクリプト */
+export function restoreBatScript(): string {
+  return `@echo off
+title KoeDoku ZIP Decoder
+setlocal
+set "SRC=koedoku-code.txt"
+set "OUT=KoeDoku-portable.zip"
+
+if not exist "%SRC%" (
+  echo.
+  echo [ERROR] %SRC% was not found in this folder.
+  echo.
+  echo Save the copied ZIP code as %SRC% here, then run again.
+  echo.
+  pause
+  exit /b 1
+)
+
+certutil -decode "%SRC%" "%OUT%" >nul 2>&1
+
+echo.
+if exist "%OUT%" (
+  echo [OK] %OUT% was created successfully.
+  echo     Right-click the ZIP and choose "Extract all" to unpack it.
+) else (
+  echo [ERROR] Failed to restore the ZIP.
+  echo     Make sure %SRC% contains the complete copied code,
+  echo     saved with encoding ANSI or UTF-8 without BOM.
+)
+echo.
+pause
+endlocal
+`;
+}
+
+/** クリップボードへコピー（非セキュア環境のフォールバック付き） */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
