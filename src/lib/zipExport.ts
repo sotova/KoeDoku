@@ -1,24 +1,217 @@
 /* ============================================================
- * ポータブルZIPパッケージング
- * 実行中のビルド資産(index.html + assets/)を収集し、
- * JS / CSS を HTML へ完全インライン化した単一ファイルを生成する。
- * 単一ファイル化により、file:// プロトコルでのダブルクリック起動でも
- * ブラウザの CORS / モジュールブロックを受けずに動作する。
+ * リリースビルドジェネレータ
+ * 実行中のビルド資産(JS/CSS)を index.html へ完全インライン化した
+ * 「単一 HTML リリース」を生成する。外部参照ゼロのため、
+ * ブラウザの file:// モジュールブロック制限を受けず、
+ * ダブルクリックだけで起動できる。
+ * 副産物として start.bat 同梱の ZIP も生成可能。
  * ============================================================ */
 import JSZip from "jszip";
 
-export interface ExportEntry {
-  path: string;
+export const RELEASE_VERSION = "v1.0.0";
+
+export interface ReleaseBuild {
+  version: string;
+  buildId: string;
+  sha256: string;
+  html: string;
+  blob: Blob;
   bytes: number;
-  note?: string;
+  jsKB: number;
+  cssKB: number;
+  assetCount: number;
 }
 
-export interface ExportResult {
+export interface ZipPackage {
   name: string;
   blob: Blob;
-  entries: ExportEntry[];
-  totalBytes: number;
+  entries: { path: string; note: string }[];
 }
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeScriptContent(js: string): string {
+  return js.replace(/<\/script/gi, "<\\/script");
+}
+
+/* ---------------- asset collection (DOM + resource timing) ---------------- */
+
+export function collectAssetUrls(): string[] {
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  const accept = (href: string) => {
+    try {
+      const u = new URL(href, document.baseURI);
+      if (u.origin !== location.origin) return;
+      if (!/\/assets\/.+\.(js|css|woff2?|png|svg|ico)$/.test(u.pathname)) return;
+      if (seen.has(u.pathname)) return;
+      seen.add(u.pathname);
+      urls.push(u.href);
+    } catch {
+      /* noop */
+    }
+  };
+  document.querySelectorAll<HTMLLinkElement>("link[rel=stylesheet][href]").forEach((el) => accept(el.href));
+  document.querySelectorAll<HTMLScriptElement>("script[src]").forEach((el) => accept(el.src));
+  try {
+    const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+    for (const e of entries) {
+      if (e.initiatorType === "script" || e.initiatorType === "link" || e.initiatorType === "css") accept(e.name);
+    }
+  } catch {
+    /* noop */
+  }
+  return urls;
+}
+
+export function getBuildId(): string {
+  let h = 2166136261;
+  for (const u of collectAssetUrls()) {
+    for (let i = 0; i < u.length; i++) {
+      h ^= u.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/* ---------------- page html ---------------- */
+
+/** fetch 失敗時のフォールバックシェル（資産側がすべてを持つためこれで十分） */
+function synthesizeShell(): string {
+  const title = document.title || "KoeDoku";
+  const pre = [...document.querySelectorAll<HTMLLinkElement>('link[rel="preconnect"]')].map((l) => l.outerHTML).join("\n");
+  const fonts = [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href*="fonts.googleapis"]')]
+    .map((l) => l.outerHTML)
+    .join("\n");
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>${title}</title>
+${pre}
+${fonts}
+</head>
+<body>
+<div id="root"></div>
+</body>
+</html>`;
+}
+
+async function fetchPageHtml(): Promise<string> {
+  const candidates = [...new Set([document.baseURI, location.href, new URL("index.html", document.baseURI).href])];
+  for (const c of candidates) {
+    try {
+      const res = await fetch(c, { cache: "no-cache" });
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (text.includes("<div id=") || text.includes("<html")) return text;
+    } catch {
+      /* next candidate */
+    }
+  }
+  return synthesizeShell();
+}
+
+async function sha256Hex(blob: Blob): Promise<string> {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return "n/a";
+  }
+}
+
+/* ---------------- release build ---------------- */
+
+export async function buildRelease(): Promise<ReleaseBuild> {
+  const assetUrls = collectAssetUrls();
+  let html = await fetchPageHtml();
+
+  let jsBytes = 0;
+  let cssBytes = 0;
+  let injectedJs = 0;
+  let injectedCss = 0;
+  let pendingJs = "";
+  let pendingCss = "";
+
+  for (const url of assetUrls) {
+    let text = "";
+    try {
+      const res = await fetch(url, { cache: "no-cache" });
+      if (!res.ok) continue;
+      text = await res.text();
+    } catch {
+      continue;
+    }
+    const rel = new URL(url).pathname.replace(/^\//, "");
+    const variants = [url, "/" + rel, rel];
+
+    if (rel.endsWith(".js")) {
+      jsBytes += text.length;
+      pendingJs = text;
+      for (const v of variants) {
+        const re = new RegExp(`<script[^>]*src=["']${escapeRegExp(v)}["'][^>]*>\\s*</script>`, "g");
+        const next = html.replace(re, () => {
+          injectedJs++;
+          return `<script type="module">${escapeScriptContent(text)}</script>`;
+        });
+        if (next !== html) {
+          html = next;
+          break;
+        }
+      }
+    } else if (rel.endsWith(".css")) {
+      cssBytes += text.length;
+      pendingCss += text;
+      for (const v of variants) {
+        const re = new RegExp(`<link[^>]*href=["']${escapeRegExp(v)}["'][^>]*>`, "g");
+        const next = html.replace(re, () => {
+          injectedCss++;
+          return `<style>${text}</style>`;
+        });
+        if (next !== html) {
+          html = next;
+          break;
+        }
+      }
+    }
+  }
+
+  // タグが見つからなかった場合の確実なフォールバック注入
+  if (pendingJs && injectedJs === 0) {
+    const tag = `<script type="module">${escapeScriptContent(pendingJs)}</script>`;
+    html = html.includes("</body>") ? html.replace("</body>", `${tag}\n</body>`) : html + tag;
+  }
+  if (pendingCss && injectedCss === 0) {
+    const tag = `<style>${pendingCss}</style>`;
+    html = html.includes("</head>") ? html.replace("</head>", `${tag}\n</head>`) : tag + html;
+  }
+
+  // file:// 起動を妨げる要素を除去
+  html = html.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, "");
+  html = html.replace(/<link[^>]*rel=["'](?:modulepreload|preload|prefetch)["'][^>]*>/g, "");
+  html = html.replace(/<link[^>]*rel=["']icon["'][^>]*href=["']\/[^"']+["'][^>]*>/g, "");
+  html = html.replace(/(src|href)="\/(?!\/)/g, '$1="./');
+
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  return {
+    version: RELEASE_VERSION,
+    buildId: getBuildId(),
+    sha256: await sha256Hex(blob),
+    html,
+    blob,
+    bytes: blob.size,
+    jsKB: Math.round(jsBytes / 1024),
+    cssKB: Math.round(cssBytes / 1024),
+    assetCount: assetUrls.length,
+  };
+}
+
+/* ---------------- ZIP (launcher bundle) ---------------- */
 
 const START_BAT = `@echo off
 chcp 65001 >nul
@@ -42,29 +235,26 @@ else
 fi
 `;
 
-function makeReadme(name: string, fileCount: number, sizeMB: string): string {
+function makeReadme(r: ReleaseBuild, sizeMB: string): string {
   return [
     "=========================================================",
     "  KoeDoku (Voice Reading) - Voice Transcription / Subtitle Sync Studio",
-    "  Portable Edition  " + name,
+    `  Release ${r.version}  (build ${r.buildId})  /  approx. ${sizeMB} MB`,
     "=========================================================",
     "",
-    "■ How to launch",
-    "  1. Right-click this ZIP -> \"Extract All\" (please extract to a folder)",
-    "  2. Open the extracted folder",
-    "  3. Double-click  start.bat  (macOS / Linux: ./start.sh)",
-    "     - You can also just double-click index.html directly",
-    "  4. KoeDoku will launch in your browser",
+    "■ How to launch (no install needed)",
+    "  1. Right-click this ZIP -> \"Extract All\"",
+    "  2. Double-click  index.html  inside the extracted folder",
+    "     (start.bat / start.sh also work)",
+    "  3. KoeDoku will launch in your browser",
     "",
+    "  * index.html is a single-file release with the program (JS/CSS)",
+    "    fully embedded. It is not affected by the browser's",
+    "    file:// loading restrictions.",
     "  * No internet connection is required for operation.",
-    "  * All scripts and styles are embedded in index.html (single file),",
-    "    so it works even when opened directly from file://.",
     "",
-    "■ Contents (" + fileCount + " files / approx. " + sizeMB + " MB)",
-    "  index.html ....... app body (JS / CSS embedded)",
-    "  start.bat ........ Windows launcher (double-click to launch)",
-    "  start.sh ......... macOS / Linux launcher",
-    "  README.txt ....... this file",
+    "■ Verification",
+    `  SHA-256: ${r.sha256}`,
     "",
     "■ Notes",
     "  * Imported audio and transcription data are saved in your browser's",
@@ -75,94 +265,29 @@ function makeReadme(name: string, fileCount: number, sizeMB: string): string {
   ].join("\r\n");
 }
 
-function collectAssetHrefs(): { htmlUrl: string; assetUrls: string[] } {
-  const htmlUrl = new URL(document.baseURI);
-  const seen = new Set<string>();
-  const assetUrls: string[] = [];
-  const push = (u: URL) => {
-    if (u.origin !== location.origin) return;
-    if (!/\/assets\/.+\.(js|css|woff2?|png|svg|ico)$/.test(u.pathname)) return;
-    if (seen.has(u.pathname)) return;
-    seen.add(u.pathname);
-    assetUrls.push(u.href);
-  };
-  document.querySelectorAll<HTMLLinkElement>("link[rel=stylesheet][href]").forEach((el) => {
-    try {
-      push(new URL(el.href, htmlUrl));
-    } catch {
-      /* noop */
-    }
-  });
-  document.querySelectorAll<HTMLScriptElement>("script[src]").forEach((el) => {
-    try {
-      push(new URL(el.src, htmlUrl));
-    } catch {
-      /* noop */
-    }
-  });
-  return { htmlUrl: htmlUrl.href, assetUrls };
-}
-
-function escRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export async function buildPortableZip(): Promise<ExportResult> {
+export async function buildPortableZipFromRelease(r: ReleaseBuild): Promise<ZipPackage> {
   const zip = new JSZip();
-  const entries: ExportEntry[] = [];
-
-  const add = (path: string, data: Blob | string, note?: string) => {
-    zip.file(path, data);
-    const bytes = typeof data === "string" ? new Blob([data]).size : data.size;
-    entries.push({ path, bytes, note });
-  };
-
-  const { htmlUrl, assetUrls } = collectAssetHrefs();
-  const htmlRes = await fetch(htmlUrl);
-  if (!htmlRes.ok) throw new Error("index.html fetch failed");
-  let html = await htmlRes.text();
-
-  /* JS / CSS を HTML へインライン化（file:// 起動を可能にする核心） */
-  for (const url of assetUrls) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`asset fetch failed: ${url}`);
-    const text = await res.text();
-    const base = url.split("/").pop() ?? "";
-    const baseEsc = escRe(base);
-    if (base.endsWith(".js")) {
-      /* バンドル内に "</script" が含まれても壊れないようエスケープ */
-      const safe = text.replace(/<\/script/gi, "<\\/script");
-      html = html.replace(
-        new RegExp(`<script[^>]*src="[^"]*${baseEsc}"[^>]*>\\s*</script>`),
-        `<script type="module">${safe}</script>`
-      );
-    } else if (base.endsWith(".css")) {
-      const safe = text.replace(/<\/style/gi, "<\\/style");
-      html = html.replace(
-        new RegExp(`<link[^>]*href="[^"]*${baseEsc}"[^>]*/?>`),
-        `<style>${safe}</style>`
-      );
-    }
-  }
-
-  /* 安全策: 残ったルート絶対参照を相対へ（favicon 等） */
-  html = html.replace(/(src|href)="\/(?!\/)/g, '$1="./');
-
-  add("index.html", html, "app body (JS / CSS embedded)");
-  add("start.bat", START_BAT, "Windows launcher");
-  add("start.sh", START_SH, "macOS / Linux launcher");
-
-  const name = "KoeDoku-portable.zip";
-  const readme = makeReadme(name, entries.length + 1, (entries.reduce((a, e) => a + e.bytes, 0) / 1024 / 1024).toFixed(2));
-  add("README.txt", readme);
-
+  zip.file("index.html", r.html);
+  zip.file("start.bat", START_BAT);
+  zip.file("start.sh", START_SH);
+  const name = "KoeDoku-release.zip";
+  zip.file("README.txt", makeReadme(r, (r.bytes / 1024 / 1024).toFixed(2)));
   const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
-  return { name, blob, entries, totalBytes: blob.size };
+  return {
+    name,
+    blob,
+    entries: [
+      { path: "index.html", note: `single-file release (JS/CSS embedded, ${fmtBytes(r.bytes)})` },
+      { path: "start.bat", note: "Windows launcher" },
+      { path: "start.sh", note: "macOS / Linux launcher" },
+      { path: "README.txt", note: "how to launch" },
+    ],
+  };
 }
 
-/* ---------------- 保存トリガ ---------------- */
+/* ---------------- save / copy ---------------- */
 
-type SaveOutcome = "saved" | "cancelled" | "failed";
+export type SaveOutcome = "saved" | "cancelled" | "failed";
 
 interface SaveFilePickerWindow {
   showSaveFilePicker?: (opts: {
@@ -171,17 +296,17 @@ interface SaveFilePickerWindow {
   }) => Promise<{ createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
 }
 
-/** 保存ダイアログ(優先) → 従来ダウンロード(フォールバック) */
-export async function savePortableZip(r: ExportResult): Promise<SaveOutcome> {
+/** save dialog (preferred) → conventional download (fallback) */
+export async function saveBlobAs(name: string, blob: Blob, mime: string, ext: string): Promise<SaveOutcome> {
   const w = window as SaveFilePickerWindow;
   if (typeof w.showSaveFilePicker === "function") {
     try {
       const handle = await w.showSaveFilePicker({
-        suggestedName: r.name,
-        types: [{ description: "ZIP archive", accept: { "application/zip": [".zip"] } }],
+        suggestedName: name,
+        types: [{ description: mime, accept: { [mime]: [ext] } }],
       });
       const writable = await handle.createWritable();
-      await writable.write(r.blob);
+      await writable.write(blob);
       await writable.close();
       return "saved";
     } catch (e) {
@@ -190,10 +315,10 @@ export async function savePortableZip(r: ExportResult): Promise<SaveOutcome> {
     }
   }
   try {
-    const url = URL.createObjectURL(r.blob);
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = r.name;
+    a.download = name;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -204,78 +329,6 @@ export async function savePortableZip(r: ExportResult): Promise<SaveOutcome> {
   }
 }
 
-/** 最終フォールバック: 別タブで開いてブラウザから保存してもらう */
-export function openZipInNewTab(blob: Blob): boolean {
-  try {
-    const url = URL.createObjectURL(blob);
-    const win = window.open(url, "_blank", "noopener");
-    window.setTimeout(() => URL.revokeObjectURL(url), 5 * 60_000);
-    return !!win;
-  } catch {
-    return false;
-  }
-}
-
-export function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(2)} MB`;
-}
-
-/* ---------------- text-route utilities (code copy & restore) ---------------- */
-
-export const CODE_FILE_NAME = "koedoku-code.txt";
-export const RESTORE_BAT_NAME = "restore-koedoku.bat";
-
-export async function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => {
-      const s = String(r.result);
-      const idx = s.indexOf(",");
-      resolve(idx >= 0 ? s.slice(idx + 1) : s);
-    };
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
-  });
-}
-
-/** Windows標準のcertutilでBase64テキストからZIPを復元するスクリプト */
-export function restoreBatScript(): string {
-  return `@echo off
-title KoeDoku ZIP Decoder
-setlocal
-set "SRC=koedoku-code.txt"
-set "OUT=KoeDoku-portable.zip"
-
-if not exist "%SRC%" (
-  echo.
-  echo [ERROR] %SRC% was not found in this folder.
-  echo.
-  echo Save the copied ZIP code as %SRC% here, then run again.
-  echo.
-  pause
-  exit /b 1
-)
-
-certutil -decode "%SRC%" "%OUT%" >nul 2>&1
-
-echo.
-if exist "%OUT%" (
-  echo [OK] %OUT% was created successfully.
-  echo     Right-click the ZIP and choose "Extract all" to unpack it.
-) else (
-  echo [ERROR] Failed to restore the ZIP.
-  echo     Make sure %SRC% contains the complete copied code,
-  echo     saved with encoding ANSI or UTF-8 without BOM.
-)
-echo.
-pause
-endlocal
-`;
-}
-
-/** クリップボードへコピー（セキュアコンテキスト外のフォールバック付き） */
 export async function copyText(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard && window.isSecureContext) {
@@ -300,4 +353,10 @@ export async function copyText(text: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }

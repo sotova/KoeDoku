@@ -9,7 +9,15 @@ import { computePeaks, deriveWords, hashStr, synthesizeDemoWav, type Peaks } fro
 import { clearDB, idbClearAll, idbDel, idbGet, idbPut, loadDB, saveDB } from "./lib/db";
 import { DEMO_FILES } from "./lib/demoData";
 import { generateSegmentsFor, runTranscriptionJob, withWords } from "./lib/transcribe";
-import { buildPortableZip, openZipInNewTab, savePortableZip, type ExportResult } from "./lib/zipExport";
+import {
+  buildPortableZipFromRelease,
+  buildRelease,
+  getBuildId,
+  RELEASE_VERSION,
+  saveBlobAs,
+  type ReleaseBuild,
+  type ZipPackage,
+} from "./lib/zipExport";
 import ExportModal from "./components/ExportModal";
 import { usePlayer } from "./hooks/usePlayer";
 import { fmtTime, uid, type DBShape, type FileRec, type JobState, type Segment, type ToastMsg } from "./lib/types";
@@ -62,9 +70,12 @@ export default function App() {
   const [archOpen, setArchOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportBuilding, setExportBuilding] = useState(false);
-  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [release, setRelease] = useState<ReleaseBuild | null>(null);
   const [exportErr, setExportErr] = useState<string | null>(null);
-  const [justSaved, setJustSaved] = useState(false);
+  const [savedKind, setSavedKind] = useState<"html" | "zip" | "copy" | null>(null);
+  const [zipBusy, setZipBusy] = useState(false);
+  const zipCacheRef = useRef<ZipPackage | null>(null);
+  const buildId = useMemo(() => getBuildId(), []);
   const [url, setUrl] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
 
@@ -94,47 +105,68 @@ export default function App() {
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
 
-  /* ---------- portable ZIP export ---------- */
-  const buildExport = useCallback(() => {
+  /* ---------- release build ---------- */
+  const buildReleaseNow = useCallback(() => {
     setExportBuilding(true);
     setExportErr(null);
-    buildPortableZip()
-      .then((r) => setExportResult(r))
+    buildRelease()
+      .then((r) => setRelease(r))
       .catch((e) => {
         console.error(e);
-        setExportErr("ビルド資産の収集に失敗しました。ページをリロードしてから再試行してください。");
+        setExportErr("リリースビルドに失敗しました。ページをリロードしてから再試行してください。");
       })
       .finally(() => setExportBuilding(false));
   }, []);
 
   const openExport = useCallback(() => {
     setExportOpen(true);
-    setJustSaved(false);
-    if (!exportResult && !exportBuilding) buildExport();
-  }, [exportResult, exportBuilding, buildExport]);
+    setSavedKind(null);
+    if (!release && !exportBuilding) buildReleaseNow();
+  }, [release, exportBuilding, buildReleaseNow]);
 
-  const handleSaveZip = useCallback(async () => {
-    if (!exportResult) return;
-    const outcome = await savePortableZip(exportResult);
+  const handleSaveHtml = useCallback(async () => {
+    if (!release) return;
+    const outcome = await saveBlobAs("KoeDoku.html", release.blob, "text/html", ".html");
     if (outcome === "saved") {
-      setJustSaved(true);
-      pushToast("ok", `${exportResult.name} を保存しました — 解凍して start.bat をダブルクリックで起動できます`);
-      window.setTimeout(() => setJustSaved(false), 3000);
+      setSavedKind("html");
+      pushToast("ok", "KoeDoku.html を保存しました — ファイルをダブルクリックで起動できます");
+      window.setTimeout(() => setSavedKind(null), 4000);
     } else if (outcome === "cancelled") {
       pushToast("info", "保存をキャンセルしました");
     } else {
-      pushToast("err", "保存できませんでした。「別タブで開く」をお試しください");
+      pushToast("err", "保存できませんでした。ルートB「HTMLコードをコピー」をお試しください");
     }
-  }, [exportResult, pushToast]);
+  }, [release, pushToast]);
 
-  const handleOpenZipTab = useCallback(() => {
-    if (!exportResult) return;
-    if (openZipInNewTab(exportResult.blob)) {
-      pushToast("info", "ZIPを別タブで開きました。ブラウザの保存操作で取り込んでください");
-    } else {
-      pushToast("err", "ポップアップがブロックされました。ブラウザの許可設定をご確認ください");
+  const handleCopyHtml = useCallback(() => {
+    setSavedKind("copy");
+    pushToast("ok", "コピーしました。メモ帳に貼り付け、KoeDoku.html として保存してください");
+    window.setTimeout(() => setSavedKind(null), 4000);
+  }, [pushToast]);
+
+  const handleSaveZip = useCallback(async () => {
+    if (!release || zipBusy) return;
+    setZipBusy(true);
+    try {
+      if (!zipCacheRef.current) zipCacheRef.current = await buildPortableZipFromRelease(release);
+      const pkg = zipCacheRef.current;
+      const outcome = await saveBlobAs(pkg.name, pkg.blob, "application/zip", ".zip");
+      if (outcome === "saved") {
+        setSavedKind("zip");
+        pushToast("ok", `${pkg.name} を保存しました — 解凍して index.html か start.bat を実行してください`);
+        window.setTimeout(() => setSavedKind(null), 4000);
+      } else if (outcome === "cancelled") {
+        pushToast("info", "保存をキャンセルしました");
+      } else {
+        pushToast("err", "ZIPの保存に失敗しました");
+      }
+    } catch (e) {
+      console.error(e);
+      pushToast("err", "ZIPの作成に失敗しました");
+    } finally {
+      setZipBusy(false);
     }
-  }, [exportResult, pushToast]);
+  }, [release, zipBusy, pushToast]);
 
   /* ---------- audio resolution ---------- */
   useEffect(() => {
@@ -421,18 +453,18 @@ export default function App() {
                 db.sqlite3 · {db.files.length} files · {db.transcripts.length} transcripts
               </span>
               <span className="hidden rounded-full border border-amber-acc/40 bg-amber-acc/10 px-2.5 py-1 font-tc text-[9.5px] text-amber-acc xl:inline-block">
-                browser prototype
+                {RELEASE_VERSION} · build {buildId.slice(0, 7)}
               </span>
               <button
                 onClick={openExport}
-                title="このアプリをZIPとしてパソコンに保存（オフラインで起動可能）"
+                title="単一ファイルのリリース版を生成（ダブルクリックで起動）"
                 className="flex items-center gap-1.5 rounded-full border border-teal-deep/60 bg-teal-deep/10 px-3 py-1 text-[11px] font-bold text-teal-acc transition-all hover:bg-teal-deep/25 active:scale-95"
               >
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
                   <path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
                 </svg>
-                ZIP書出
+                リリース版
               </button>
               <button
                 onClick={() => setArchOpen(true)}
@@ -528,11 +560,13 @@ export default function App() {
         onClose={() => setExportOpen(false)}
         building={exportBuilding}
         error={exportErr}
-        onRetry={buildExport}
-        result={exportResult}
-        onSave={handleSaveZip}
-        onOpenTab={handleOpenZipTab}
-        justSaved={justSaved}
+        onRetry={buildReleaseNow}
+        release={release}
+        onSaveHtml={handleSaveHtml}
+        onCopyHtml={handleCopyHtml}
+        onSaveZip={handleSaveZip}
+        savedKind={savedKind}
+        zipBusy={zipBusy}
         onToast={pushToast}
       />
 
